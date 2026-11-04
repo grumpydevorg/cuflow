@@ -986,6 +986,7 @@ def audit_external_footprints(
             read_jlc_bom,
             read_jlc_pnp,
             read_preflight_placements,
+            smd_spacing_table,
         )
     else:
         from pcb_assembly import (
@@ -1001,6 +1002,7 @@ def audit_external_footprints(
             read_jlc_bom,
             read_jlc_pnp,
             read_preflight_placements,
+            smd_spacing_table,
         )
 
     try:
@@ -1096,14 +1098,26 @@ def audit_external_footprints(
         spacing_coverage_detail,
     )
 
-    if spacing_geometry_errors:
+    table = None
+    spacing_source = JLCPCB_SMD_SPACING_URL
+    table_error = None
+    if "smd_body_spacing_mm" in profile:
+        try:
+            table = smd_spacing_table(profile["smd_body_spacing_mm"])
+            spacing_source = table.source
+        except ValueError as error:
+            table_error = str(error)
+    if table_error is not None:
+        audit.add("JLCPCB SMD body spacing", False,
+                  f"cannot read smd_body_spacing_mm: {table_error}")
+    elif spacing_geometry_errors:
         audit.add(
             "JLCPCB SMD body spacing", False,
             "not evaluated because applicable package body geometry is missing",
         )
     else:
         spacing_violations, spacing_pair_count = (
-            jlcpcb_body_spacing_violations(placed_bodies))
+            jlcpcb_body_spacing_violations(placed_bodies, table=table))
         if spacing_violations:
             spacing_detail = (
                 f"{len(spacing_violations)}/{spacing_pair_count} applicable "
@@ -1122,7 +1136,7 @@ def audit_external_footprints(
                 "meet JLCPCB's recommended package-pair minimums")
         spacing_detail_html = (
             html_cell(spacing_detail) +
-            f' (<a href="{html_cell(JLCPCB_SMD_SPACING_URL)}" '
+            f' (<a href="{html_cell(spacing_source)}" '
             'target="_blank" rel="noopener noreferrer">JLCPCB source</a>)'
         )
         audit.add(
