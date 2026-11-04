@@ -23,6 +23,7 @@ from tools.pcb_assembly import (
     read_jlc_bom,
     read_jlc_pnp,
     read_preflight_placements,
+    smd_spacing_table,
 )
 from tools.pcb_topology import DrillHit, build_topology
 
@@ -143,6 +144,39 @@ class ComponentSpacingTests(unittest.TestCase):
             (first, second))
         self.assertEqual(violations, ())
         self.assertEqual(pair_count, 0)
+
+    def table(self):
+        categories = ["0201", "0402", "0603", "0805", "1206",
+                      "QFN", "QFP", "SOP/SOIC", "SOT", "BGA"]
+        return {"source": "https://example.com/spacing",
+                "categories": categories,
+                "rows": [[0.3] * 10 for _ in categories]}
+
+    def test_a_profile_table_replaces_the_built_in_one(self):
+        first = self.placed_body("R1", "R0402", (0, 0))
+        second = self.placed_body("R2", "R0402", (1.149, 0))
+        violations, _ = jlcpcb_body_spacing_violations(
+            (first, second), table=smd_spacing_table(self.table()))
+        self.assertEqual([v.required for v in violations], [0.3])
+        rows = self.table()
+        rows["rows"][1][1] = 0.1
+        violations, _ = jlcpcb_body_spacing_violations(
+            (first, second), table=smd_spacing_table(rows))
+        self.assertEqual(violations, ())
+
+    def test_a_profile_table_is_checked(self):
+        asymmetric = self.table()
+        asymmetric["rows"][0][1] = 0.5
+        missing = self.table()
+        missing["categories"] = missing["categories"][:-1]
+        missing["rows"] = [row[:-1] for row in missing["rows"][:-1]]
+        negative = self.table()
+        negative["rows"][2][2] = -0.1
+        unsourced = self.table()
+        del unsourced["source"]
+        for bad in (asymmetric, missing, negative, unsourced, [], {"rows": []}):
+            with self.assertRaises(ValueError, msg=bad):
+                smd_spacing_table(bad)
 
 
 class AttachmentTests(unittest.TestCase):

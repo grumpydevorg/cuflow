@@ -11,7 +11,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 import shapely.affinity as sa
 import shapely.geometry as sg
@@ -193,6 +193,47 @@ def jlcpcb_smd_spacing_mm(first_category: str, second_category: str) -> float:
     return _JLCPCB_SMD_SPACING_ROWS[first][second]
 
 
+@dataclass(frozen=True)
+class SpacingTable:
+    """A package-pair spacing table given in a profile, and its source."""
+    source: str
+    required: Mapping[tuple[str, str], float]
+
+
+def smd_spacing_table(value: Any) -> SpacingTable:
+    """A profile's `smd_body_spacing_mm`: its `source`, its `categories`
+    (exactly the categories `jlcpcb_smd_category` gives) and `rows`, a
+    symmetric matrix of finite non-negative millimetres in that order."""
+    if not isinstance(value, dict) or set(value) != {"source", "categories", "rows"}:
+        raise ValueError("smd_body_spacing_mm needs exactly source, categories and rows")
+    source, categories, rows = value["source"], value["categories"], value["rows"]
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("smd_body_spacing_mm source must be text")
+    if not isinstance(categories, list) or sorted(categories) != sorted(
+            JLCPCB_SMD_CATEGORIES) or len(set(categories)) != len(categories):
+        raise ValueError(
+            "smd_body_spacing_mm categories must be "
+            + ", ".join(JLCPCB_SMD_CATEGORIES))
+    size = len(categories)
+    if not isinstance(rows, list) or len(rows) != size or not all(
+            isinstance(row, list) and len(row) == size for row in rows):
+        raise ValueError(f"smd_body_spacing_mm rows must be {size} x {size}")
+    for row in rows:
+        for cell in row:
+            if isinstance(cell, bool) or not isinstance(cell, (int, float)) \
+                    or not math.isfinite(cell) or cell < 0:
+                raise ValueError(
+                    f"smd_body_spacing_mm: {cell!r} is not a finite distance >= 0")
+    required = {}
+    for i, first in enumerate(categories):
+        for j, second in enumerate(categories):
+            if rows[i][j] != rows[j][i]:
+                raise ValueError(
+                    f"smd_body_spacing_mm is not symmetric at {first}, {second}")
+            required[first, second] = float(rows[i][j])
+    return SpacingTable(source, required)
+
+
 def place_component_body(
         footprint: ExternalFootprint, placement: Placement) -> PlacedBody:
     """Place a nominal package body at its JLCPCB PNP location."""
@@ -219,9 +260,11 @@ def place_component_body(
 
 
 def jlcpcb_body_spacing_violations(
-        bodies: Iterable[PlacedBody], tolerance: float = 1e-9
+        bodies: Iterable[PlacedBody], tolerance: float = 1e-9,
+        table: SpacingTable | None = None,
         ) -> tuple[tuple[BodySpacingViolation, ...], int]:
-    """Check same-side body gaps against JLCPCB's package-pair table."""
+    """Check same-side body gaps against JLCPCB's package-pair table, or
+    against `table` (a profile's) when given."""
     ordered = sorted(bodies, key=lambda body: body.designator)
     violations: list[BodySpacingViolation] = []
     pair_count = 0
@@ -229,7 +272,10 @@ def jlcpcb_body_spacing_violations(
         if first.side != second.side:
             continue
         pair_count += 1
-        required = jlcpcb_smd_spacing_mm(first.category, second.category)
+        if table is None:
+            required = jlcpcb_smd_spacing_mm(first.category, second.category)
+        else:
+            required = table.required[first.category, second.category]
         clearance = first.geometry.distance(second.geometry)
         if clearance + tolerance < required:
             violations.append(BodySpacingViolation(
