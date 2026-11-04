@@ -442,14 +442,74 @@ def audit_manufacturing_files(
             )
 
 
+def edge_exceptions(profile: dict[str, Any], layers) -> list[dict[str, Any]]:
+    """The profile's `copper_edge_exceptions`, checked: each names a copper
+    layer whose edge clearance is checked, a polygon (at least three
+    [x, y] points, mm), the clearance its copper must keep instead of the
+    layer's (negative: how far it may reach past the edge) and a reason."""
+    import shapely.geometry as sg
+    found = profile.get("copper_edge_exceptions") or []
+    if not isinstance(found, list):
+        raise ValueError("copper_edge_exceptions must be a list")
+    out = []
+    for number, item in enumerate(found, 1):
+        where = f"exception {number}"
+        if not isinstance(item, dict) or set(item) != {
+                "layer", "polygon", "clearance_mm", "reason"}:
+            raise ValueError(
+                f"{where} needs exactly layer, polygon, clearance_mm and reason")
+        if item["layer"] not in layers:
+            raise ValueError(f"{where}: layer {item['layer']!r} is not checked")
+        if not isinstance(item["reason"], str) or not item["reason"].strip():
+            raise ValueError(f"{where}: reason must be text")
+        clearance = item["clearance_mm"]
+        if isinstance(clearance, bool) or not isinstance(clearance, (int, float)) \
+                or not math.isfinite(clearance):
+            raise ValueError(f"{where}: clearance_mm must be a finite number")
+        points = item["polygon"]
+        if not isinstance(points, list) or len(points) < 3 or not all(
+                isinstance(p, list) and len(p) == 2 and all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for v in p) for p in points):
+            raise ValueError(f"{where}: polygon needs at least three [x, y] points")
+        polygon = sg.Polygon(points)
+        if not polygon.is_valid or polygon.area <= 0:
+            raise ValueError(f"{where}: polygon is not a valid area")
+        out.append({**item, "number": number, "geometry": polygon,
+                     "clearance_mm": float(clearance)})
+    return out
+
+
+def signed_edge_clearance(copper, perimeter) -> tuple[float, Any]:
+    """How far `copper` keeps inside `perimeter` (mm), or minus how far it
+    reaches past it, and the copper point that sets it. The overhang is
+    measured at the vertices of the copper outside the perimeter."""
+    import shapely.geometry as sg
+    from shapely.ops import nearest_points
+    outside = copper.difference(perimeter)
+    if outside.is_empty:
+        point, _ = nearest_points(copper, perimeter.boundary)
+        return copper.distance(perimeter.boundary), point
+    parts = getattr(outside, "geoms", [outside])
+    vertices = [sg.Point(xy) for part in parts
+                for ring in (part.exterior, *part.interiors)
+                for xy in ring.coords]
+    point = max(vertices, key=perimeter.distance)
+    return -perimeter.distance(point), point
+
+
 def audit_copper_edges(audit: Audit, profile: dict[str, Any]) -> None:
-    """Check all copper, including artwork, against the outer GML perimeter."""
+    """Check all copper, including artwork, against the outer GML perimeter.
+
+    Copper inside a `copper_edge_exceptions` region is checked against that
+    exception's clearance instead, and an exception covering no copper on
+    its layer fails."""
     # Routed edges by default; profiles can specify larger V-score clearances.
     # A partial override must not silently disable the other copper layer.
     limits = {"GTL": 0.2, "GBL": 0.2}
     limits.update(profile.get("copper_edge_clearance_mm") or {})
     import shapely.geometry as sg
-    from shapely.ops import nearest_points
+    from shapely.ops import nearest_points, unary_union
     if __package__:
         from .pcb_topology import (
             TopologyFormatError, parse_cuflow_gerber, parse_cuflow_paths_text)
@@ -473,15 +533,40 @@ def audit_copper_edges(audit: Audit, profile: dict[str, Any]) -> None:
                   f"cannot read perimeter: {error}")
         return
 
+    try:
+        exceptions = edge_exceptions(profile, limits)
+    except ValueError as error:
+        audit.add("Copper-to-board-edge clearance", False,
+                  f"cannot read copper_edge_exceptions: {error}")
+        return
+
     for layer, limit in limits.items():
         name = f"{layer} copper-to-board-edge clearance"
+        mine = [e for e in exceptions if e["layer"] == layer]
         try:
             clearance = float(limit)
             if not math.isfinite(clearance) or clearance < 0:
                 raise ValueError("clearance must be finite and nonnegative")
             copper = parse_cuflow_gerber(ROOT / f"{board}.{layer}")
+            for exception in mine:
+                excepted = copper.intersection(exception["geometry"])
+                label = f"{layer} copper-to-board-edge exception {exception['number']}"
+                allowed = exception["clearance_mm"]
+                if excepted.is_empty:
+                    audit.add(label, False,
+                              f"{exception['reason']}: covers no copper")
+                    continue
+                distance, point = signed_edge_clearance(excepted, perimeter)
+                audit.add(label, distance + 1e-9 >= allowed,
+                          f"{exception['reason']}: minimum {distance:.4f} mm; "
+                          f"allowed {allowed:.3f} mm; at ({point.x:.3f}, "
+                          f"{point.y:.3f}) mm")
+            if mine:
+                copper = copper.difference(
+                    unary_union([e["geometry"] for e in mine]))
             if copper.is_empty:
-                audit.add(name, True, "no copper on layer")
+                audit.add(name, True, "no copper on layer outside exceptions"
+                          if mine else "no copper on layer")
                 continue
             outside = copper.difference(perimeter)
             if not outside.is_empty:

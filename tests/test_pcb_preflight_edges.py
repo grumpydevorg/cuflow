@@ -84,3 +84,84 @@ class CopperEdgeTests(unittest.TestCase):
                     "copper_edge_clearance_mm": {"GBL": 0.4},
                 })
             self.assertFalse(audit.passed)
+
+
+def region(x0, y0, x1, y1):
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+
+class CopperEdgeExceptionTests(unittest.TestCase):
+    """A profile may let copper inside a named region come closer to the
+    edge than the layer's limit, or reach past it (a negative clearance)."""
+
+    check_copper = CopperEdgeTests.check_copper
+
+    def check_exception(self, copper, *exceptions):
+        return self.check_copper(copper, overrides={
+            "copper_edge_exceptions": list(exceptions)})
+
+    def exception(self, clearance, polygon=None, layer="GTL"):
+        return {
+            "layer": layer,
+            "polygon": polygon or region(-1, 4, 1, 6),
+            "clearance_mm": clearance,
+            "reason": "J2 pads at the notch",
+        }
+
+    def checks(self, audit):
+        return {c.name: c for c in audit.checks}
+
+    def test_copper_inside_the_region_meets_the_exception(self):
+        audit = self.check_exception(
+            [sg.box(.1, 4.5, 1, 5), sg.box(2, 2, 8, 8)], self.exception(0.1))
+        checks = self.checks(audit)
+        self.assertTrue(checks["GTL copper-to-board-edge clearance"].passed)
+        exception = checks["GTL copper-to-board-edge exception 1"]
+        self.assertTrue(exception.passed)
+        self.assertIn("J2 pads at the notch", exception.detail)
+        self.assertIn("minimum 0.1000 mm; allowed 0.100 mm", exception.detail)
+        # GBL has the same copper and no exception.
+        self.assertFalse(checks["GBL copper-to-board-edge clearance"].passed)
+
+    def test_copper_closer_than_the_exception_fails(self):
+        audit = self.check_exception([sg.box(.05, 4.5, 1, 5)], self.exception(0.1))
+        self.assertFalse(
+            self.checks(audit)["GTL copper-to-board-edge exception 1"].passed)
+
+    def test_negative_clearance_allows_an_overhang(self):
+        copper = [sg.box(-.08, 4.5, 1, 5)]
+        ok = self.checks(self.check_exception(copper, self.exception(-0.08)))
+        self.assertTrue(ok["GTL copper-to-board-edge exception 1"].passed)
+        self.assertIn("minimum -0.0800 mm", ok["GTL copper-to-board-edge exception 1"].detail)
+        short = self.checks(self.check_exception(copper, self.exception(-0.05)))
+        self.assertFalse(short["GTL copper-to-board-edge exception 1"].passed)
+
+    def test_copper_outside_the_region_keeps_the_layer_limit(self):
+        audit = self.check_exception(
+            [sg.box(.1, 4.5, 1, 5), sg.box(.1, 8, 1, 9)], self.exception(0.1))
+        checks = self.checks(audit)
+        self.assertTrue(checks["GTL copper-to-board-edge exception 1"].passed)
+        self.assertFalse(checks["GTL copper-to-board-edge clearance"].passed)
+
+    def test_an_exception_covering_no_copper_fails(self):
+        audit = self.check_exception(
+            [sg.box(2, 2, 8, 8)], self.exception(0.1, region(-1, 0, 1, 1)))
+        check = self.checks(audit)["GTL copper-to-board-edge exception 1"]
+        self.assertFalse(check.passed)
+        self.assertIn("covers no copper", check.detail)
+
+    def test_a_malformed_exception_fails_closed(self):
+        for bad in (
+            {"layer": "GTL", "polygon": region(0, 0, 1, 1), "clearance_mm": 0.1},
+            {"layer": "GXL", "polygon": region(0, 0, 1, 1), "clearance_mm": 0.1,
+             "reason": "r"},
+            {"layer": "GTL", "polygon": [[0, 0], [1, 1]], "clearance_mm": 0.1,
+             "reason": "r"},
+            {"layer": "GTL", "polygon": region(0, 0, 1, 1),
+             "clearance_mm": float("nan"), "reason": "r"},
+        ):
+            audit = self.check_exception([sg.box(2, 2, 8, 8)], bad)
+            self.assertFalse(audit.passed, bad)
+            self.assertIn(
+                "cannot read copper_edge_exceptions",
+                " ".join(c.detail for c in audit.checks))
